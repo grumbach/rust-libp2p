@@ -1117,6 +1117,49 @@ where
         self.queries.add_iter_closest(target.clone(), peers, inner);
     }
 
+    /// refreshes publications and replications
+    fn refresh_records(&mut self, cx: &mut Context<'_>) {
+        println!("Performing refresh queries for records.");
+
+        let now = Instant::now();
+
+        // Calculate the available capacity for queries triggered by background jobs.
+        let mut jobs_query_capacity = JOBS_MAX_QUERIES.saturating_sub(self.queries.size());
+
+        // Run the provider announcement job.
+        if let Some(mut job) = self.add_provider_job.take() {
+            let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
+            for _ in 0..num {
+                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
+                    self.start_add_provider(r.key, AddProviderContext::Republish)
+                } else {
+                    break;
+                }
+            }
+            jobs_query_capacity -= num;
+            self.add_provider_job = Some(job);
+        }
+
+        // Run the record replication / publication job.
+        if let Some(mut job) = self.put_record_job.take() {
+            let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
+            for _ in 0..num {
+                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
+                    let context =
+                        if r.publisher.as_ref() == Some(self.kbuckets.local_key().preimage()) {
+                            PutRecordContext::Republish
+                        } else {
+                            PutRecordContext::Replicate
+                        };
+                    self.start_put_record(r, Quorum::All, context)
+                } else {
+                    break;
+                }
+            }
+            self.put_record_job = Some(job);
+        }
+    }
+
     /// Updates the routing table with a new connection status and address of a peer.
     fn connection_updated(
         &mut self,
@@ -2310,42 +2353,6 @@ where
     ) -> Poll<ToSwarm<Self::OutEvent, THandlerInEvent<Self>>> {
         let now = Instant::now();
 
-        // Calculate the available capacity for queries triggered by background jobs.
-        let mut jobs_query_capacity = JOBS_MAX_QUERIES.saturating_sub(self.queries.size());
-
-        // Run the periodic provider announcement job.
-        if let Some(mut job) = self.add_provider_job.take() {
-            let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
-            for _ in 0..num {
-                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
-                    self.start_add_provider(r.key, AddProviderContext::Republish)
-                } else {
-                    break;
-                }
-            }
-            jobs_query_capacity -= num;
-            self.add_provider_job = Some(job);
-        }
-
-        // Run the periodic record replication / publication job.
-        if let Some(mut job) = self.put_record_job.take() {
-            let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
-            for _ in 0..num {
-                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
-                    let context =
-                        if r.publisher.as_ref() == Some(self.kbuckets.local_key().preimage()) {
-                            PutRecordContext::Republish
-                        } else {
-                            PutRecordContext::Replicate
-                        };
-                    self.start_put_record(r, Quorum::All, context)
-                } else {
-                    break;
-                }
-            }
-            self.put_record_job = Some(job);
-        }
-
         loop {
             // Drain queued events first.
             if let Some(event) = self.queued_events.pop_front() {
@@ -2366,6 +2373,9 @@ where
                     addresses: value,
                     old_peer: entry.evicted.map(|n| n.key.into_preimage()),
                 };
+
+                // refresh records as routing is updated
+                self.refresh_records(cx);
                 return Poll::Ready(ToSwarm::GenerateEvent(event));
             }
 
